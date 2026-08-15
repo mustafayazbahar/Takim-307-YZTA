@@ -16,6 +16,7 @@ Canlı demo dayanıklılığı (Demo Day'de jürinin kotaya takılması sonrası
 import hashlib
 import json
 import os
+import time
 from collections import OrderedDict
 
 from google import genai
@@ -27,6 +28,10 @@ from personas import GENEL_TALIMAT, PERSONAS
 
 class KotaAsildi(RuntimeError):
     """Tanımlı tüm API anahtarlarının kotası dolduğunda fırlatılır."""
+
+
+class ModelMesgul(RuntimeError):
+    """Model geçici olarak yoğun (503) ve yedek modeller de yanıt vermediğinde."""
 
 
 # --- Model seçimi -----------------------------------------------------------
@@ -168,6 +173,20 @@ def _kota_hatasi_mi(hata: Exception) -> bool:
     )
 
 
+def _gecici_hata_mi(hata: Exception) -> bool:
+    """Sunucu kaynaklı geçici hata mı? (503 yoğunluk, 500, zaman aşımı)
+
+    Kota hatasından farklıdır: anahtar değiştirmek işe yaramaz, beklemek veya
+    başka bir modele düşmek gerekir.
+    """
+    metin = str(hata).lower()
+    return any(
+        im in metin
+        for im in ("unavailable", "503", "500", "overloaded", "high demand",
+                   "internal error", "deadline")
+    )
+
+
 def _sonraki_anahtara_gec() -> bool:
     """Sıradaki anahtara geçer; başka anahtar kalmadıysa False döner."""
     global _AKTIF
@@ -177,24 +196,61 @@ def _sonraki_anahtara_gec() -> bool:
     return False
 
 
-def cagir(islev):
-    """Verilen model çağrısını, kota hatasında anahtar değiştirerek yürütür.
+def _model_zinciri() -> list[str]:
+    """Denenecek modeller: aktif model, ardından tercih sırasındaki alt sürümler.
 
-    islev: istemciyi parametre alan ve model yanıtını döndüren fonksiyon.
+    Yeni çıkan modeller yoğunluk nedeniyle 503 verebiliyor; bu zincir sayesinde
+    uygulama sessizce kararlı bir sürüme düşer.
     """
-    while True:
-        try:
-            return islev(_istemci())
-        except Exception as hata:
-            if _kota_hatasi_mi(hata) and _sonraki_anahtara_gec():
-                continue  # sıradaki anahtarla tekrar dene
-            if _kota_hatasi_mi(hata):
-                raise KotaAsildi(
-                    "Tanımlı tüm API anahtarlarının günlük kotası doldu. "
-                    "Kayıtlı analizleri görmek için galeri modunu kullanabilir "
-                    "veya yeni bir anahtar tanımlayabilirsiniz."
-                ) from hata
-            raise
+    zincir = [get_model()]
+    kullanilabilir = mevcut_modeller()
+    for tercih in TERCIH_SIRASI:
+        for ad in kullanilabilir:
+            if ad.startswith(tercih) and ad not in zincir:
+                zincir.append(ad)
+                break
+    return zincir
+
+
+_DENEME_SAYISI = 3  # aynı model için yeniden deneme adedi
+
+
+def cagir(islev):
+    """Model çağrısını dayanıklı biçimde yürütür.
+
+    islev: (istemci, model) alıp model yanıtını döndüren fonksiyon.
+
+    Sırasıyla:
+      * Kota hatası (429)  -> sıradaki API anahtarına geçer, hepsi dolarsa KotaAsildi
+      * Geçici hata (503)  -> artan bekleme ile yeniden dener, ısrar ederse alt modele düşer
+      * Diğer hatalar      -> olduğu gibi yükseltilir (gizlenmez)
+    """
+    son_hata: Exception | None = None
+    for model in _model_zinciri():
+        for deneme in range(_DENEME_SAYISI):
+            try:
+                return islev(_istemci(), model)
+            except Exception as hata:
+                son_hata = hata
+                if _kota_hatasi_mi(hata):
+                    if _sonraki_anahtara_gec():
+                        continue  # aynı model, yeni anahtar
+                    raise KotaAsildi(
+                        "Tanımlı tüm API anahtarlarının günlük kotası doldu. "
+                        "Kayıtlı analizleri görmek için galeri modunu kullanabilir "
+                        "veya yeni bir anahtar tanımlayabilirsiniz."
+                    ) from hata
+                if _gecici_hata_mi(hata):
+                    if deneme < _DENEME_SAYISI - 1:
+                        time.sleep(1.5 * (2 ** deneme))  # 1.5s, 3s
+                        continue
+                    break  # bu modelde ısrar etme, zincirdeki alt modele geç
+                raise
+    raise ModelMesgul(
+        "Model şu anda yoğun ve yedek modeller de yanıt vermedi. "
+        "Birkaç dakika sonra tekrar deneyin; bu arada galeri modundan kayıtlı "
+        "analizleri inceleyebilirsiniz."
+    ) from son_hata
 
 
 # --- Sonuç önbelleği --------------------------------------------------------
@@ -243,8 +299,8 @@ def analiz_et(
         )
 
     yanit = cagir(
-        lambda istemci: istemci.models.generate_content(
-            model=model,
+        lambda istemci, aktif_model: istemci.models.generate_content(
+            model=aktif_model,
             contents=icerik,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",

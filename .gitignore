@@ -8,3 +8,6 @@ __pycache__/
 vendor/
 .pytest_cache/
 .ruff_cache/
+
+app/geri_bildirimler.json
+app/galeri/**/gecici*

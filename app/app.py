@@ -23,7 +23,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 import feedback
 import gallery
-from analyzer import KotaAsildi, analiz_et
+from analyzer import KotaAsildi, ModelMesgul, analiz_et
 from annotate import bolgeleri_isaretle
 from coordinator import koordine_et
 from dyslexia_sim import disleksi_metni
@@ -445,14 +445,27 @@ if durum["aktif_sekme"] == "Analiz Paneli":
                         for anahtar in secilen_personalar
                     }
                     kota_doldu = False
+                    model_mesgul = False
                     for future in futures:
                         anahtar = futures[future]
                         try:
                             sonuclar[anahtar] = future.result()
                         except KotaAsildi:
                             kota_doldu = True
+                        except ModelMesgul:
+                            model_mesgul = True
                         except Exception as hata:
                             st.error(f"Analiz başarısız ({PERSONAS[anahtar]['ad']}): {hata}")
+
+            # Model yoğunluğu: geçici durum, tekrar denemeye yönlendir.
+            if model_mesgul:
+                st.warning(
+                    "⏳ **Model şu anda yoğun.** Google tarafında geçici bir "
+                    "yoğunluk var (503). Sistem otomatik olarak yeniden denedi ve "
+                    "yedek modele düştü, yine de yanıt alınamadı. Birkaç dakika "
+                    "sonra tekrar deneyin veya **Ayarlar** sayfasından daha kararlı "
+                    "bir model seçin."
+                )
 
             # Kota bittiğinde ham hata yerine yönlendirici mesaj göster.
             if kota_doldu:

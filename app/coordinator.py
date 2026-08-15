@@ -14,7 +14,7 @@ import json
 from google.genai import types
 from pydantic import BaseModel, Field
 
-from analyzer import cagir, get_model
+from analyzer import cagir
 from personas import PERSONAS
 
 SENTEZ_TALIMATI = """
@@ -115,8 +115,8 @@ def koordine_et(sonuclar: dict[str, dict], gecmis_rapor: dict | None = None) -> 
     try:
         # cagir(): kota dolarsa sıradaki API anahtarına otomatik geçer.
         yanit = cagir(
-            lambda istemci: istemci.models.generate_content(
-                model=get_model(),
+            lambda istemci, aktif_model: istemci.models.generate_content(
+                model=aktif_model,
                 contents=[prompt],
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
