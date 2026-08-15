@@ -4,7 +4,7 @@ from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 
-from analyzer import MODEL, _istemci, get_model
+from analyzer import cagir, get_model
 
 KUTU_TALIMATI = """
 Bu arayüz görüntüsünde aşağıda tarif edilen sorunlu bölgeleri bul.
@@ -81,17 +81,19 @@ def bolgeleri_isaretle(
         return None
     liste = "\n".join(f"{i}. {t}" for i, t in enumerate(bolge_tarifleri, 1))
     try:
-        istemci = _istemci()
-        yanit = istemci.models.generate_content(
-            model=get_model(),
-            contents=[
-                types.Part.from_bytes(data=goruntu_bytes, mime_type=mime_type),
-                KUTU_TALIMATI + liste,
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=KutuKumesi,
-            ),
+        # cagir(): kota dolarsa sıradaki API anahtarına otomatik geçer.
+        yanit = cagir(
+            lambda istemci: istemci.models.generate_content(
+                model=get_model(),
+                contents=[
+                    types.Part.from_bytes(data=goruntu_bytes, mime_type=mime_type),
+                    KUTU_TALIMATI + liste,
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=KutuKumesi,
+                ),
+            )
         )
         data = json.loads(yanit.text)
         kutular = data.get("kutular", [])

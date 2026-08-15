@@ -14,7 +14,7 @@ import json
 from google.genai import types
 from pydantic import BaseModel, Field
 
-from analyzer import MODEL, _istemci, get_model
+from analyzer import cagir, get_model
 from personas import PERSONAS
 
 SENTEZ_TALIMATI = """
@@ -113,14 +113,16 @@ def koordine_et(sonuclar: dict[str, dict], gecmis_rapor: dict | None = None) -> 
         prompt += "\n\nÖnemli: Lütfen bu analizi aşağıdaki geçmiş analiz raporu ile karşılaştırarak 'gelisim_yorumu' alanını doldur:\n" + json.dumps(gecmis_rapor, ensure_ascii=False)
 
     try:
-        istemci = _istemci()
-        yanit = istemci.models.generate_content(
-            model=get_model(),
-            contents=[prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=CoordinatorSentezCiktisi,
-            ),
+        # cagir(): kota dolarsa sıradaki API anahtarına otomatik geçer.
+        yanit = cagir(
+            lambda istemci: istemci.models.generate_content(
+                model=get_model(),
+                contents=[prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=CoordinatorSentezCiktisi,
+                ),
+            )
         )
         rapor = json.loads(yanit.text)
         rapor["_yedek_mod"] = False

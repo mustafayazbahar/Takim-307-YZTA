@@ -3,10 +3,20 @@
 Ekran görüntüsünü seçilen persona gözüyle analiz eder ve yapılandırılmış
 JSON çıktı döndürür. JSON şeması zorunlu tutularak halüsinasyon riski
 azaltılır (model serbest metin yerine şemaya uymak zorunda kalır).
+
+Canlı demo dayanıklılığı (Demo Day'de jürinin kotaya takılması sonrası eklendi):
+  * Birden fazla API anahtarı tanımlanabilir; biri kotaya takılırsa sıradakine
+    otomatik geçilir (GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3...).
+  * Aynı görüntü + persona kombinasyonu tekrar istenirse önbellekten döner;
+    tekrarlı demolar kota yakmaz.
+  * Tüm anahtarlar tükenirse ham hata yerine KotaAsildi fırlatılır; arayüz
+    kullanıcıyı çevrimdışı galeri moduna yönlendirir.
 """
 
+import hashlib
 import json
 import os
+from collections import OrderedDict
 
 from google import genai
 from google.genai import types
@@ -14,22 +24,84 @@ from pydantic import BaseModel, Field
 
 from personas import GENEL_TALIMAT, PERSONAS
 
-# Varsayılan model; Streamlit session_state içinden dinamik ezilebilir.
-DEFAULTS_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+class KotaAsildi(RuntimeError):
+    """Tanımlı tüm API anahtarlarının kotası dolduğunda fırlatılır."""
+
+
+# --- Model seçimi -----------------------------------------------------------
+# Tercih sırası: en yeni önce. Uygulama açılışında API'ye "hangi modeller
+# kullanılabilir" diye sorulur ve bu listeden ilk eşleşen seçilir. Böylece
+# Google yeni sürüm yayınladığında kod değişmeden yükseltme gerçekleşir,
+# anahtar o modele erişemiyorsa da sessizce bir alt sürüme düşülür.
+TERCIH_SIRASI = (
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3-flash",
+    "gemini-2.5-flash",
+)
+
+# GEMINI_MODEL tanımlıysa otomatik seçim devre dışı kalır (elle sabitleme).
+_ELLE_MODEL = os.getenv("GEMINI_MODEL", "").strip()
+_COZULEN_MODEL: str | None = None
+_MODEL_LISTESI: list[str] | None = None
+
+# Geriye dönük uyumluluk: coordinator.py ve annotate.py bu adı içe aktarıyor.
+DEFAULTS_MODEL = _ELLE_MODEL or TERCIH_SIRASI[-1]
 MODEL = DEFAULTS_MODEL
 
 
+def mevcut_modeller() -> list[str]:
+    """API anahtarının erişebildiği metin üretimi modellerini döner (önbellekli)."""
+    global _MODEL_LISTESI
+    if _MODEL_LISTESI is not None:
+        return _MODEL_LISTESI
+    try:
+        adlar = []
+        for m in _istemci().models.list():
+            ad = (getattr(m, "name", "") or "").removeprefix("models/")
+            # Yalnızca içerik üretebilen modeller; gömme (embedding) modelleri elenir.
+            eylemler = getattr(m, "supported_actions", None) or []
+            if ad and (not eylemler or "generateContent" in eylemler):
+                adlar.append(ad)
+        _MODEL_LISTESI = sorted(set(adlar))
+    except Exception:
+        # Ağ/kota sorunu: bilinen listeyle devam et, uygulama durmasın.
+        _MODEL_LISTESI = list(TERCIH_SIRASI)
+    return _MODEL_LISTESI
+
+
+def _modeli_coz() -> str:
+    """Tercih sırasındaki ilk erişilebilir modeli seçer (bir kez hesaplanır)."""
+    global _COZULEN_MODEL
+    if _ELLE_MODEL:
+        return _ELLE_MODEL
+    if _COZULEN_MODEL:
+        return _COZULEN_MODEL
+    kullanilabilir = mevcut_modeller()
+    for tercih in TERCIH_SIRASI:
+        for ad in kullanilabilir:
+            if ad.startswith(tercih):
+                _COZULEN_MODEL = ad
+                return ad
+    _COZULEN_MODEL = TERCIH_SIRASI[-1]
+    return _COZULEN_MODEL
+
+
 def get_model() -> str:
-    """Aktif modeli döner; streamlit session_state önceliklidir."""
+    """Aktif modeli döner; Streamlit'ten yapılan seçim önceliklidir."""
     try:
         import streamlit as st
-        if "secilen_model" in st.session_state and st.session_state["secilen_model"]:
-            return st.session_state["secilen_model"]
+
+        secilen = st.session_state.get("secilen_model")
+        if secilen:
+            return secilen
     except Exception:
         pass
-    return DEFAULTS_MODEL
+    return _modeli_coz()
 
 
+# --- Çıktı şemaları ---------------------------------------------------------
 class SorunluAlan(BaseModel):
     bolge: str = Field(description="Ekrandaki konum tarifi, örn: 'sağ üst köşedeki menü'")
     sorun: str = Field(description="Sorunun açıklaması")
@@ -37,30 +109,110 @@ class SorunluAlan(BaseModel):
 
 
 class PersonaAnalizCiktisi(BaseModel):
-    bilissel_yuk_skoru: int = Field(ge=1, le=100, description="1-100 arası tamsayı; 1=çok rahat, 100=aşırı yorucu")
+    bilissel_yuk_skoru: int = Field(
+        ge=1, le=100, description="1-100 arası tamsayı; 1=çok rahat, 100=aşırı yorucu"
+    )
     genel_degerlendirme: str = Field(description="2-3 cümlelik özet")
     sorunlu_alanlar: list[SorunluAlan] = Field(description="En fazla 5 sorunlu alan listesi")
     oneriler: list[str] = Field(description="Somut, uygulanabilir iyileştirme önerileri listesi")
-    pozitif_yonler: list[str] = Field(description="Arayüzün bu persona için iyi yaptığı şeyler listesi")
+    pozitif_yonler: list[str] = Field(description="Arayüzün bu persona için iyi yaptığı şeyler")
 
 
-# İstemci bir kez oluşturulup saklanır; her çağrıda yeniden oluşturulursa
-# Python geçici nesneyi erken temizleyip bağlantıyı kapatabiliyor
-# ("Cannot send a request, as the client has been closed" hatası).
-_CLIENT: genai.Client | None = None
+# --- Anahtar havuzu ve istemci ---------------------------------------------
+def _anahtarlari_topla() -> list[str]:
+    """GEMINI_API_KEY, GEMINI_API_KEY_2, ... sırasıyla toplanır."""
+    anahtarlar = []
+    ilk = os.getenv("GEMINI_API_KEY", "").strip()
+    if ilk:
+        anahtarlar.append(ilk)
+    for i in range(2, 11):
+        ek = os.getenv(f"GEMINI_API_KEY_{i}", "").strip()
+        if ek:
+            anahtarlar.append(ek)
+    return anahtarlar
+
+
+_ISTEMCILER: dict[int, genai.Client] = {}
+_AKTIF = 0
+
+
+def anahtar_sayisi() -> int:
+    """Tanımlı API anahtarı sayısı (arayüzde bilgi amaçlı)."""
+    return len(_anahtarlari_topla())
 
 
 def _istemci() -> genai.Client:
-    global _CLIENT
-    if _CLIENT is None:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "GEMINI_API_KEY bulunamadı. .env dosyası oluşturup anahtarınızı ekleyin "
-                "(https://aistudio.google.com adresinden ücretsiz alınır)."
-            )
-        _CLIENT = genai.Client(api_key=api_key)
-    return _CLIENT
+    """Aktif anahtarın istemcisini döner; istemciler tekrar kullanılır.
+
+    (Her çağrıda yeni istemci oluşturmak "client has been closed" hatasına
+    yol açıyordu; bu yüzden örnekler saklanıyor.)
+    """
+    anahtarlar = _anahtarlari_topla()
+    if not anahtarlar:
+        raise RuntimeError(
+            "GEMINI_API_KEY bulunamadı. Yerelde app/.env dosyasına, bulutta "
+            "Streamlit Secrets alanına ekleyin "
+            "(anahtar https://aistudio.google.com adresinden ücretsiz alınır)."
+        )
+    if _AKTIF not in _ISTEMCILER:
+        _ISTEMCILER[_AKTIF] = genai.Client(api_key=anahtarlar[_AKTIF])
+    return _ISTEMCILER[_AKTIF]
+
+
+def _kota_hatasi_mi(hata: Exception) -> bool:
+    """Hata mesajından kota/hız sınırı ihlali olup olmadığını anlar."""
+    metin = str(hata).lower()
+    return any(
+        im in metin
+        for im in ("resource_exhausted", "429", "quota", "rate limit", "exceeded")
+    )
+
+
+def _sonraki_anahtara_gec() -> bool:
+    """Sıradaki anahtara geçer; başka anahtar kalmadıysa False döner."""
+    global _AKTIF
+    if _AKTIF + 1 < len(_anahtarlari_topla()):
+        _AKTIF += 1
+        return True
+    return False
+
+
+def cagir(islev):
+    """Verilen model çağrısını, kota hatasında anahtar değiştirerek yürütür.
+
+    islev: istemciyi parametre alan ve model yanıtını döndüren fonksiyon.
+    """
+    while True:
+        try:
+            return islev(_istemci())
+        except Exception as hata:
+            if _kota_hatasi_mi(hata) and _sonraki_anahtara_gec():
+                continue  # sıradaki anahtarla tekrar dene
+            if _kota_hatasi_mi(hata):
+                raise KotaAsildi(
+                    "Tanımlı tüm API anahtarlarının günlük kotası doldu. "
+                    "Kayıtlı analizleri görmek için galeri modunu kullanabilir "
+                    "veya yeni bir anahtar tanımlayabilirsiniz."
+                ) from hata
+            raise
+
+
+# --- Sonuç önbelleği --------------------------------------------------------
+# Aynı görüntü aynı persona ile tekrar analiz edilirse model çağrısı yapılmaz.
+# Demo sırasında aynı sayfanın defalarca gösterilmesi kotayı tüketmesin diye.
+_ONBELLEK: OrderedDict[str, dict] = OrderedDict()
+_ONBELLEK_SINIRI = 64
+
+
+def _onbellek_anahtari(goruntu: bytes, persona: str, html: str | None, model: str) -> str:
+    ozet = hashlib.sha256(goruntu).hexdigest()[:32]
+    html_ozet = hashlib.sha256((html or "").encode()).hexdigest()[:12]
+    return f"{ozet}|{persona}|{html_ozet}|{model}"
+
+
+def onbellegi_temizle() -> None:
+    """Arayüzden 'yeniden analiz et' istendiğinde çağrılır."""
+    _ONBELLEK.clear()
 
 
 def analiz_et(
@@ -68,9 +220,16 @@ def analiz_et(
     mime_type: str,
     persona_anahtari: str,
     html_kodu: str | None = None,
+    onbellek_kullan: bool = True,
 ) -> dict:
     """Tek persona için görüntü (+ opsiyonel HTML) analizi yapar, dict döner."""
     persona = PERSONAS[persona_anahtari]
+    model = get_model()
+
+    anahtar = _onbellek_anahtari(goruntu_bytes, persona_anahtari, html_kodu, model)
+    if onbellek_kullan and anahtar in _ONBELLEK:
+        _ONBELLEK.move_to_end(anahtar)
+        return _ONBELLEK[anahtar]
 
     icerik: list = [
         types.Part.from_bytes(data=goruntu_bytes, mime_type=mime_type),
@@ -83,13 +242,19 @@ def analiz_et(
             "```html\n" + html_kodu[:20000] + "\n```"
         )
 
-    istemci = _istemci()
-    yanit = istemci.models.generate_content(
-        model=get_model(),
-        contents=icerik,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=PersonaAnalizCiktisi,
-        ),
+    yanit = cagir(
+        lambda istemci: istemci.models.generate_content(
+            model=model,
+            contents=icerik,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=PersonaAnalizCiktisi,
+            ),
+        )
     )
-    return json.loads(yanit.text)
+    sonuc = json.loads(yanit.text)
+
+    _ONBELLEK[anahtar] = sonuc
+    if len(_ONBELLEK) > _ONBELLEK_SINIRI:
+        _ONBELLEK.popitem(last=False)
+    return sonuc

@@ -23,7 +23,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 import feedback
 import gallery
-from analyzer import analiz_et
+from analyzer import KotaAsildi, analiz_et
 from annotate import bolgeleri_isaretle
 from coordinator import koordine_et
 from dyslexia_sim import disleksi_metni
@@ -444,12 +444,23 @@ if durum["aktif_sekme"] == "Analiz Paneli":
                                         anahtar, durum.get("html")): anahtar
                         for anahtar in secilen_personalar
                     }
+                    kota_doldu = False
                     for future in futures:
                         anahtar = futures[future]
                         try:
                             sonuclar[anahtar] = future.result()
+                        except KotaAsildi:
+                            kota_doldu = True
                         except Exception as hata:
                             st.error(f"Analiz başarısız ({PERSONAS[anahtar]['ad']}): {hata}")
+
+            # Kota bittiğinde ham hata yerine yönlendirici mesaj göster.
+            if kota_doldu:
+                st.warning(
+                    "⏳ **Günlük API kotası doldu.** Yeni analiz şu an yapılamıyor — "
+                    "sol taraftan **📁 Galeri** kaynağını seçerek kayıtlı analizleri "
+                    "inceleyebilirsiniz. Kota her gün sıfırlanır."
+                )
 
             if sonuclar:
                 with st.spinner("Koordinatör ajan bulguları sentezliyor..."):
@@ -700,18 +711,22 @@ elif durum["aktif_sekme"] == "Ayarlar":
     
     # 1. AI Model Ayarları
     st.markdown("####  Yapay Zeka Model Yapılandırması")
-    from analyzer import get_model
+    from analyzer import anahtar_sayisi, get_model, mevcut_modeller, onbellegi_temizle
     current_model = get_model()
-    
-    modeller = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash", "gemini-1.5-pro"]
+
+    # Model listesi API'den canlı çekilir: Google yeni sürüm yayınladığında
+    # kod değişmeden listede belirir.
+    with st.spinner("Kullanılabilir modeller alınıyor..."):
+        modeller = mevcut_modeller()
     if current_model not in modeller:
-        modeller.append(current_model)
-        
+        modeller.insert(0, current_model)
+
     secilen_model = st.selectbox(
         "Kullanılacak Gemini Modeli",
         options=modeller,
         index=modeller.index(current_model),
-        help="Ajanların analizi gerçekleştirmek için kullanacağı temel model. gemini-2.5-flash hızlı ve kararlıdır."
+        help="Liste, API anahtarınızın erişebildiği modellerden canlı olarak alınır. "
+             "Varsayılan olarak erişilebilen en yeni Flash sürümü seçilir."
     )
     if secilen_model != durum.get("secilen_model"):
         durum["secilen_model"] = secilen_model
@@ -719,7 +734,22 @@ elif durum["aktif_sekme"] == "Ayarlar":
         st.rerun()
 
     st.markdown("---")
-    
+
+    # 1b. Kota ve önbellek durumu
+    st.markdown("#### 🔑 API Anahtarı ve Kota Yönetimi")
+    _anahtar_adet = anahtar_sayisi()
+    st.info(
+        f"Tanımlı API anahtarı: **{_anahtar_adet}**. Bir anahtarın kotası dolduğunda "
+        "sistem otomatik olarak sıradakine geçer. Ek anahtar tanımlamak için "
+        "`GEMINI_API_KEY_2`, `GEMINI_API_KEY_3` ... değişkenlerini kullanın "
+        "(yerelde .env, bulutta Streamlit Secrets)."
+    )
+    if st.button("🔄 Analiz önbelleğini temizle", use_container_width=True):
+        onbellegi_temizle()
+        st.success("Önbellek temizlendi; sonraki analiz modele yeniden sorulacak.")
+
+    st.markdown("---")
+
     # 2. Galeri & Hafıza Veri Yönetimi
     st.markdown("#### 🧹 Veri ve Geçmiş Yönetimi")
     st.info("Kayıtlı analiz geçmişi ve galeri verilerini buradan sıfırlayabilirsiniz.")
